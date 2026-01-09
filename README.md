@@ -22,6 +22,8 @@ meross-cli -email <email> -password <password> [options]
 | `-password` | Account password |
 | `-url` | API base URL (see below) |
 | `-json` | Output in JSON format |
+| `-find` | Scan LAN for devices after cloud login |
+| `-find-range` | IP range to scan (default: `192.168.178`) |
 
 ### API URLs
 
@@ -103,4 +105,45 @@ Found 2 device(s):
 
 ```bash
 ./meross-cli -email user@example.com -password mypassword -url https://iotx-us.refoss.net
+```
+
+### Scan LAN for devices
+
+After cloud login, scan your local network to find device IPs and match them to your cloud account:
+
+```bash
+./meross-cli -email user@example.com -password mypassword -url https://iotx.meross.com -find
+```
+
+```
+Logging in as user@example.com...
+Login successful!
+Fetching devices...
+
+Found 2 device(s):
+...
+
+Scanning LAN 192.168.178.1-254 for devices...
+
+Found 3 device(s) on LAN:
+
+1. 192.168.178.108
+   UUID:     24093082407560510d05c4e7ae0bfa20
+   Type:     mss305
+   Cloud:    YES (Smart Screen Stube)
+
+2. 192.168.178.112
+   UUID:     24093018748822510d05c4e7ae0bf297
+   Type:     mss305
+   Cloud:    YES (TV Schrank + Router)
+
+3. 192.168.178.62
+   UUID:     23080402135087510d0448e1e9d4cd6a
+   Cloud:    NO (not in this account)
+```
+
+Use a custom IP range:
+
+```bash
+./meross-cli -email user@example.com -password mypassword -find -find-range 192.168.1
 ```

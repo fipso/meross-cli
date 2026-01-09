@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -327,97 +329,116 @@ func QueryDevice(ip string, key string, verbose bool) (*DeviceResponse, string, 
 	return &deviceResp, string(body), nil
 }
 
-func runQuery(args []string) {
-	queryFlags := flag.NewFlagSet("query", flag.ExitOnError)
-	jsonOutput := queryFlags.Bool("json", false, "Output in JSON format")
-	key := queryFlags.String("key", "", "Device key (from cloud login, optional)")
-	verbose := queryFlags.Bool("verbose", false, "Show raw response")
-	queryFlags.Parse(args)
+// ScanResult holds the result of scanning an IP
+type ScanResult struct {
+	IP       string
+	UUID     string
+	MAC      string
+	Type     string
+	Firmware string
+	Name     string // from cloud if matched
+	Online   bool   // from cloud if matched
+	InCloud  bool
+}
 
-	if queryFlags.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: meross-cli query <device-ip> [-json] [-key <key>] [-verbose]")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Example: meross-cli query 192.168.178.50")
-		os.Exit(1)
+// ScanLAN scans an IP range for Meross devices
+func ScanLAN(ipRange string, key string, cloudDevices []Device) []ScanResult {
+	var results []ScanResult
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Parse IP range (e.g., "192.168.178" or "192.168.1")
+	baseIP := strings.TrimSuffix(ipRange, ".")
+
+	// Create a map of cloud UUIDs for quick lookup
+	cloudMap := make(map[string]Device)
+	for _, d := range cloudDevices {
+		cloudMap[d.UUID] = d
 	}
 
-	ip := queryFlags.Arg(0)
-	fmt.Fprintf(os.Stderr, "Querying device at %s...\n", ip)
+	// Scan IPs 1-254 concurrently
+	semaphore := make(chan struct{}, 50) // Limit concurrent requests
 
-	resp, rawBody, err := QueryDevice(ip, *key, *verbose)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
-		os.Exit(1)
-	}
+	for i := 1; i <= 254; i++ {
+		wg.Add(1)
+		go func(ip string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
-	// Check for error response - device still reveals UUID in header
-	if resp.Header.Method == "ERROR" {
-		fmt.Println("\nDevice responded with error (key required for full info)")
-		fmt.Printf("  UUID: %s\n", resp.Header.UUID)
-		fmt.Println("\nTo get full info, use the key from cloud login:")
-		fmt.Println("  meross-cli query <ip> -key <key>")
-		return
-	}
-
-	hw := resp.Payload.All.System.Hardware
-	fw := resp.Payload.All.System.Firmware
-
-	if *jsonOutput {
-		// Print raw response for full JSON
-		fmt.Println(rawBody)
-		return
-	}
-
-	fmt.Println("\nDevice Info:")
-	fmt.Printf("  UUID:       %s\n", hw.UUID)
-	fmt.Printf("  Type:       %s\n", hw.Type)
-	fmt.Printf("  SubType:    %s\n", hw.SubType)
-	fmt.Printf("  MAC:        %s\n", hw.MacAddress)
-	fmt.Printf("  IP:         %s\n", fw.InnerIP)
-	fmt.Printf("  Firmware:   %s\n", fw.Version)
-	fmt.Printf("  Hardware:   %s\n", hw.Version)
-	fmt.Printf("  WiFi MAC:   %s\n", fw.WifiMac)
-	fmt.Printf("  Server:     %s:%d\n", fw.Server, fw.Port)
-	fmt.Printf("  User ID:    %d\n", fw.UserID)
-
-	if len(resp.Payload.All.Digest.ToggleX) > 0 {
-		fmt.Println("  Channels:")
-		for _, ch := range resp.Payload.All.Digest.ToggleX {
-			state := "off"
-			if ch.OnOff == 1 {
-				state = "on"
+			// First try WITHOUT key to discover device (gets UUID from error response)
+			resp, _, err := QueryDevice(ip, "", false)
+			if err != nil {
+				return
 			}
-			fmt.Printf("    - [%d] %s\n", ch.Channel, state)
-		}
+
+			// Check if we got a valid response (even error responses have UUID)
+			uuid := resp.Header.UUID
+			if uuid == "" {
+				uuid = resp.Payload.All.System.Hardware.UUID
+			}
+			if uuid == "" {
+				return
+			}
+
+			result := ScanResult{
+				IP:   ip,
+				UUID: uuid,
+			}
+
+			// If we got full device info (not just error)
+			if resp.Header.Method != "ERROR" {
+				result.MAC = resp.Payload.All.System.Hardware.MacAddress
+				result.Type = resp.Payload.All.System.Hardware.Type
+				result.Firmware = resp.Payload.All.System.Firmware.Version
+			}
+
+			// Check if device is in cloud account
+			if cloudDev, ok := cloudMap[uuid]; ok {
+				result.InCloud = true
+				result.Name = cloudDev.DevName
+				result.Online = cloudDev.OnlineStatus == 1
+				if result.Type == "" {
+					result.Type = cloudDev.DeviceType
+				}
+
+				// If in cloud and we have a key, try to get full info
+				if key != "" && result.MAC == "" {
+					resp2, _, err2 := QueryDevice(ip, key, false)
+					if err2 == nil && resp2.Header.Method != "ERROR" {
+						result.MAC = resp2.Payload.All.System.Hardware.MacAddress
+						result.Type = resp2.Payload.All.System.Hardware.Type
+						result.Firmware = resp2.Payload.All.System.Firmware.Version
+					}
+				}
+			}
+
+			mu.Lock()
+			results = append(results, result)
+			mu.Unlock()
+		}(fmt.Sprintf("%s.%d", baseIP, i))
 	}
+
+	wg.Wait()
+	return results
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
-	if len(os.Args) > 1 && os.Args[1] == "query" {
-		runQuery(os.Args[2:])
-		return
-	}
-
 	email := flag.String("email", "", "Meross/Refoss account email")
 	password := flag.String("password", "", "Meross/Refoss account password")
 	baseURL := flag.String("url", "", "API base URL\n    \tRefoss EU: https://iotx-eu.refoss.net (default)\n    \tRefoss US: https://iotx-us.refoss.net\n    \tMeross: https://iotx.meross.com")
 	jsonOutput := flag.Bool("json", false, "Output in JSON format")
+	findDevices := flag.Bool("find", false, "Scan LAN for devices after cloud login")
+	findRange := flag.String("find-range", "192.168.178", "IP range to scan (e.g., 192.168.1)")
 
 	flag.Parse()
 
 	if *email == "" || *password == "" {
-		fmt.Fprintln(os.Stderr, "Usage:")
-		fmt.Fprintln(os.Stderr, "  meross-cli -email <email> -password <password>   List devices from cloud")
-		fmt.Fprintln(os.Stderr, "  meross-cli query <device-ip>                     Query device by IP")
+		fmt.Fprintln(os.Stderr, "Usage: meross-cli -email <email> -password <password> [options]")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Cloud Options:")
 		flag.PrintDefaults()
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Query Options:")
-		fmt.Fprintln(os.Stderr, "  -json        Output in JSON format")
-		fmt.Fprintln(os.Stderr, "  -key         Device key (from cloud login, optional)")
 		os.Exit(1)
 	}
 
@@ -471,5 +492,42 @@ func main() {
 			}
 		}
 		fmt.Println()
+	}
+
+	// LAN scanning if -find flag is set
+	if *findDevices {
+		fmt.Fprintf(os.Stderr, "\nScanning LAN %s.1-254 for devices...\n", *findRange)
+		results := ScanLAN(*findRange, client.key, devices)
+
+		// Sort results by IP
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].IP < results[j].IP
+		})
+
+		if len(results) == 0 {
+			fmt.Println("\nNo devices found on LAN.")
+			return
+		}
+
+		fmt.Printf("\nFound %d device(s) on LAN:\n\n", len(results))
+		for i, r := range results {
+			fmt.Printf("%d. %s\n", i+1, r.IP)
+			fmt.Printf("   UUID:     %s\n", r.UUID)
+			if r.MAC != "" {
+				fmt.Printf("   MAC:      %s\n", r.MAC)
+			}
+			if r.Type != "" {
+				fmt.Printf("   Type:     %s\n", r.Type)
+			}
+			if r.Firmware != "" {
+				fmt.Printf("   Firmware: %s\n", r.Firmware)
+			}
+			if r.InCloud {
+				fmt.Printf("   Cloud:    YES (%s)\n", r.Name)
+			} else {
+				fmt.Printf("   Cloud:    NO (not in this account)\n")
+			}
+			fmt.Println()
+		}
 	}
 }
