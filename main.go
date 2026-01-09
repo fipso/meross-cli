@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -64,6 +65,19 @@ type Channel struct {
 	DevName    string `json:"devName"`
 	Type       string `json:"type"`
 	DevIconID  string `json:"devIconId"`
+}
+
+// UdpDevice represents a device discovered via UDP broadcast
+type UdpDevice struct {
+	UUID        string `json:"uuid"`
+	IP          string `json:"ip"`
+	MAC         string `json:"mac"`
+	DeviceType  string `json:"deviceType"`
+	DevName     string `json:"devName"`
+	Port        int    `json:"port"`
+	DevHardWare string `json:"devHardWare"`
+	DevSoftWare string `json:"devSoftWare"`
+	SubType     string `json:"subType"`
 }
 
 func NewClient(baseURL string) *Client {
@@ -204,21 +218,239 @@ func (c *Client) GetDevices() ([]Device, error) {
 	return devices, nil
 }
 
-func main() {
-	rand.Seed(time.Now().UnixNano())
+// DiscoverDevices finds devices on the local network via UDP broadcast
+func DiscoverDevices(timeout time.Duration, verbose bool, broadcastIP string) ([]UdpDevice, error) {
+	// Listen on port 9989 for responses
+	listenAddr, err := net.ResolveUDPAddr("udp", ":9989")
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve listen address: %w", err)
+	}
 
-	email := flag.String("email", "", "Meross/Refoss account email")
-	password := flag.String("password", "", "Meross/Refoss account password")
-	baseURL := flag.String("url", "", "API base URL\n    \tRefoss EU: https://iotx-eu.refoss.net (default)\n    \tRefoss US: https://iotx-us.refoss.net\n    \tMeross: https://iot.meross.com")
-	jsonOutput := flag.Bool("json", false, "Output in JSON format")
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Binding to UDP port 9989...\n")
+	}
 
-	flag.Parse()
+	conn, err := net.ListenUDP("udp", listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on UDP port 9989: %w", err)
+	}
+	defer conn.Close()
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Successfully bound to port 9989\n")
+	}
+
+	// Enable broadcast
+	broadcastAddr, err := net.ResolveUDPAddr("udp", broadcastIP+":9988")
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve broadcast address: %w", err)
+	}
+
+	// Try multiple discovery request formats
+	// 1. Wildcard for all devices
+	// 2. Special ID used by app for unbound device discovery
+	requests := []string{
+		`{"id":"*","devName":"*"}`,
+		`{"id":"4305487a249f71fa2a0296c1d2655b56","devName":"*"}`,
+	}
+
+	for _, request := range requests {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "[DEBUG] Sending broadcast to %s:9988: %s\n", broadcastIP, request)
+		}
+
+		_, err = conn.WriteToUDP([]byte(request), broadcastAddr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send discovery broadcast: %w", err)
+		}
+	}
+
+	return collectResponses(conn, timeout, verbose)
+}
+
+// DiscoverDeviceByUUID finds a specific device by UUID on the local network
+func DiscoverDeviceByUUID(uuid string, timeout time.Duration, verbose bool, broadcastIP string) ([]UdpDevice, error) {
+	listenAddr, err := net.ResolveUDPAddr("udp", ":9989")
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve listen address: %w", err)
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Binding to UDP port 9989...\n")
+	}
+
+	conn, err := net.ListenUDP("udp", listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on UDP port 9989: %w", err)
+	}
+	defer conn.Close()
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Successfully bound to port 9989\n")
+	}
+
+	broadcastAddr, err := net.ResolveUDPAddr("udp", broadcastIP+":9988")
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve broadcast address: %w", err)
+	}
+
+	request := fmt.Sprintf(`{"id":"%s","devName":"*"}`, uuid)
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Sending broadcast to %s:9988: %s\n", broadcastIP, request)
+	}
+
+	_, err = conn.WriteToUDP([]byte(request), broadcastAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send discovery broadcast: %w", err)
+	}
+
+	return collectResponses(conn, timeout, verbose)
+}
+
+func collectResponses(conn *net.UDPConn, timeout time.Duration, verbose bool) ([]UdpDevice, error) {
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Broadcast sent, waiting for responses (timeout: %v)...\n", timeout)
+	}
+
+	// Collect responses
+	devices := make(map[string]UdpDevice) // Use map to dedupe by UUID
+	conn.SetReadDeadline(time.Now().Add(timeout))
+
+	buf := make([]byte, 4096)
+	for {
+		n, addr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			// Timeout is expected - means we're done collecting responses
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "[DEBUG] Timeout reached, stopping discovery\n")
+				}
+				break
+			}
+			return nil, fmt.Errorf("error reading UDP response: %w", err)
+		}
+
+		if verbose {
+			fmt.Fprintf(os.Stderr, "[DEBUG] Received %d bytes from %s: %s\n", n, addr.String(), string(buf[:n]))
+		}
+
+		var device UdpDevice
+		if err := json.Unmarshal(buf[:n], &device); err != nil {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "[DEBUG] Failed to parse response: %v\n", err)
+			}
+			continue
+		}
+
+		// Fill in IP from response address if not in payload
+		if device.IP == "" {
+			device.IP = addr.IP.String()
+		}
+
+		if device.UUID != "" {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "[DEBUG] Found device: UUID=%s, IP=%s, MAC=%s\n", device.UUID, device.IP, device.MAC)
+			}
+			devices[device.UUID] = device
+		}
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Discovery complete, found %d device(s)\n", len(devices))
+	}
+
+	// Convert map to slice
+	result := make([]UdpDevice, 0, len(devices))
+	for _, d := range devices {
+		result = append(result, d)
+	}
+
+	return result, nil
+}
+
+func runDiscover(args []string) {
+	discoverFlags := flag.NewFlagSet("discover", flag.ExitOnError)
+	jsonOutput := discoverFlags.Bool("json", false, "Output in JSON format")
+	timeout := discoverFlags.Int("timeout", 3, "Discovery timeout in seconds")
+	verbose := discoverFlags.Bool("verbose", false, "Show debug output")
+	uuid := discoverFlags.String("uuid", "", "Discover specific device by UUID")
+	broadcast := discoverFlags.String("broadcast", "255.255.255.255", "Broadcast IP address (try your subnet broadcast, e.g. 192.168.1.255)")
+	discoverFlags.Parse(args)
+
+	fmt.Fprintln(os.Stderr, "Discovering devices on local network...")
+
+	var devices []UdpDevice
+	var err error
+
+	if *uuid != "" {
+		devices, err = DiscoverDeviceByUUID(*uuid, time.Duration(*timeout)*time.Second, *verbose, *broadcast)
+	} else {
+		devices, err = DiscoverDevices(time.Duration(*timeout)*time.Second, *verbose, *broadcast)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Discovery failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *jsonOutput {
+		output, _ := json.MarshalIndent(devices, "", "  ")
+		fmt.Println(string(output))
+		return
+	}
+
+	if len(devices) == 0 {
+		fmt.Println("\nNo devices found on local network.")
+		return
+	}
+
+	fmt.Printf("\nFound %d device(s):\n\n", len(devices))
+	for i, d := range devices {
+		fmt.Printf("%d. %s\n", i+1, d.DevName)
+		fmt.Printf("   UUID:     %s\n", d.UUID)
+		fmt.Printf("   IP:       %s\n", d.IP)
+		fmt.Printf("   MAC:      %s\n", d.MAC)
+		fmt.Printf("   Type:     %s\n", d.DeviceType)
+		fmt.Printf("   Firmware: %s\n", d.DevSoftWare)
+		fmt.Printf("   Hardware: %s\n", d.DevHardWare)
+		if d.Port != 0 {
+			fmt.Printf("   Port:     %d\n", d.Port)
+		}
+		fmt.Println()
+	}
+}
+
+func printUsage() {
+	fmt.Fprintln(os.Stderr, "Usage:")
+	fmt.Fprintln(os.Stderr, "  meross-cli -email <email> -password <password>   List devices from cloud account")
+	fmt.Fprintln(os.Stderr, "  meross-cli discover                              Discover devices on local network")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Cloud Options:")
+	fmt.Fprintln(os.Stderr, "  -email       Account email address")
+	fmt.Fprintln(os.Stderr, "  -password    Account password")
+	fmt.Fprintln(os.Stderr, "  -url         API base URL")
+	fmt.Fprintln(os.Stderr, "               Refoss EU: https://iotx-eu.refoss.net (default)")
+	fmt.Fprintln(os.Stderr, "               Refoss US: https://iotx-us.refoss.net")
+	fmt.Fprintln(os.Stderr, "               Meross: https://iot.meross.com")
+	fmt.Fprintln(os.Stderr, "  -json        Output in JSON format")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Discover Options:")
+	fmt.Fprintln(os.Stderr, "  -uuid        Discover specific device by UUID")
+	fmt.Fprintln(os.Stderr, "  -timeout     Discovery timeout in seconds (default: 3)")
+	fmt.Fprintln(os.Stderr, "  -json        Output in JSON format")
+	fmt.Fprintln(os.Stderr, "  -verbose     Show debug output")
+}
+
+func runCloud(args []string) {
+	cloudFlags := flag.NewFlagSet("cloud", flag.ExitOnError)
+	email := cloudFlags.String("email", "", "Meross/Refoss account email")
+	password := cloudFlags.String("password", "", "Meross/Refoss account password")
+	baseURL := cloudFlags.String("url", "", "API base URL\n    \tRefoss EU: https://iotx-eu.refoss.net (default)\n    \tRefoss US: https://iotx-us.refoss.net\n    \tMeross: https://iot.meross.com")
+	jsonOutput := cloudFlags.Bool("json", false, "Output in JSON format")
+	cloudFlags.Parse(args)
 
 	if *email == "" || *password == "" {
-		fmt.Fprintln(os.Stderr, "Usage: meross-cli -email <email> -password <password>")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Options:")
-		flag.PrintDefaults()
+		printUsage()
 		os.Exit(1)
 	}
 
@@ -273,4 +505,16 @@ func main() {
 		}
 		fmt.Println()
 	}
+}
+
+func main() {
+	rand.Seed(time.Now().UnixNano())
+
+	if len(os.Args) > 1 && os.Args[1] == "discover" {
+		runDiscover(os.Args[2:])
+		return
+	}
+
+	// Default: cloud login mode
+	runCloud(os.Args[1:])
 }

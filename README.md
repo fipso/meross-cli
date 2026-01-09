@@ -10,17 +10,32 @@ go build -o meross-cli .
 
 ## Usage
 
+### Cloud API (list devices from account)
+
 ```bash
 meross-cli -email <email> -password <password> [options]
 ```
 
-### Options
+### Local Discovery (find devices on LAN)
+
+```bash
+meross-cli discover [options]
+```
+
+### Cloud Options
 
 | Flag | Description |
 |------|-------------|
 | `-email` | Account email address |
 | `-password` | Account password |
 | `-url` | API base URL (see below) |
+| `-json` | Output in JSON format |
+
+### Discover Options
+
+| Flag | Description |
+|------|-------------|
+| `-timeout` | Discovery timeout in seconds (default: 3) |
 | `-json` | Output in JSON format |
 
 ### API URLs
@@ -103,4 +118,38 @@ Found 2 device(s):
 
 ```bash
 ./meross-cli -email user@example.com -password mypassword -url https://iotx-us.refoss.net
+```
+
+### Discover devices on local network
+
+```bash
+./meross-cli discover
+```
+
+```
+Discovering devices on local network...
+
+Found 2 device(s):
+
+1. Living Room Plug
+   UUID:     2201063512345678901234567890abcd
+   IP:       192.168.1.100
+   MAC:      aa:bb:cc:dd:ee:ff
+   Type:     mss310
+   Firmware: 3.2.7
+   Hardware: 3.0.0
+
+2. Kitchen Strip
+   UUID:     2201063587654321098765432109fedc
+   IP:       192.168.1.101
+   MAC:      11:22:33:44:55:66
+   Type:     mss425e
+   Firmware: 3.1.4
+   Hardware: 2.0.0
+```
+
+### Discover with longer timeout
+
+```bash
+./meross-cli discover -timeout 5
 ```
