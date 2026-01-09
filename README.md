@@ -29,7 +29,7 @@ meross-cli -email <email> -password <password> [options]
 |---------|--------|-----|
 | Refoss | EU | `https://iotx-eu.refoss.net` (default) |
 | Refoss | US | `https://iotx-us.refoss.net` |
-| Meross | Global | `https://iot.meross.com` |
+| Meross | Global | `https://iotx.meross.com` |
 
 ## Examples
 
@@ -96,7 +96,7 @@ Found 2 device(s):
 ### Using with Meross account
 
 ```bash
-./meross-cli -email user@example.com -password mypassword -url https://iot.meross.com
+./meross-cli -email user@example.com -password mypassword -url https://iotx.meross.com
 ```
 
 ### Using with Refoss US account
