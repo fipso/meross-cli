@@ -264,8 +264,9 @@ func (c *Client) GetDevices() ([]Device, error) {
 	return devices, nil
 }
 
-// QueryDevice queries a device directly by IP address
-func QueryDevice(ip string, key string, verbose bool) (*DeviceResponse, string, error) {
+// QueryDevice queries a device directly by IP address. Pass an empty uuid for
+// discovery (unsigned) and the discovered uuid for a signed follow-up query.
+func QueryDevice(ip string, uuid string, key string, verbose bool) (*DeviceResponse, string, error) {
 	messageID := md5Hash(randomString(16) + fmt.Sprintf("%d", time.Now().Unix()))
 	timestamp := time.Now().Unix()
 
@@ -280,7 +281,7 @@ func QueryDevice(ip string, key string, verbose bool) (*DeviceResponse, string, 
 			From:           fmt.Sprintf("http://%s/config", ip),
 			PayloadVersion: 1,
 			Namespace:      "Appliance.System.All",
-			UUID:           "", // Empty for discovery
+			UUID:           uuid, // empty for discovery, device uuid for signed query
 			Sign:           sign,
 			TriggerSrc:     "GoCLI",
 			Timestamp:      timestamp,
@@ -291,10 +292,6 @@ func QueryDevice(ip string, key string, verbose bool) (*DeviceResponse, string, 
 	reqJSON, err := json.Marshal(reqData)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	if verbose {
-		fmt.Fprintf(os.Stderr, "[DEBUG] Request: %s\n", string(reqJSON))
 	}
 
 	url := fmt.Sprintf("http://%s/config", ip)
@@ -317,8 +314,10 @@ func QueryDevice(ip string, key string, verbose bool) (*DeviceResponse, string, 
 		return nil, "", fmt.Errorf("failed to read response: %w", err)
 	}
 
+	// Only log for hosts that actually responded, so a full LAN scan isn't
+	// drowned out by dead-host noise.
 	if verbose {
-		fmt.Fprintf(os.Stderr, "[DEBUG] Response: %s\n", string(body))
+		fmt.Fprintf(os.Stderr, "[DEBUG] %s\n  Request:  %s\n  Response: %s\n", ip, string(reqJSON), string(body))
 	}
 
 	var deviceResp DeviceResponse
@@ -331,18 +330,19 @@ func QueryDevice(ip string, key string, verbose bool) (*DeviceResponse, string, 
 
 // ScanResult holds the result of scanning an IP
 type ScanResult struct {
-	IP       string
-	UUID     string
-	MAC      string
-	Type     string
-	Firmware string
-	Name     string // from cloud if matched
-	Online   bool   // from cloud if matched
-	InCloud  bool
+	IP          string
+	UUID        string
+	MAC         string
+	Type        string
+	Firmware    string
+	Name        string // from cloud if matched
+	Online      bool   // from cloud if matched
+	InCloud     bool
+	KeyRejected bool // signed query was refused (device key != our account key)
 }
 
 // ScanLAN scans an IP range for Meross devices
-func ScanLAN(ipRange string, key string, cloudDevices []Device) []ScanResult {
+func ScanLAN(ipRange string, key string, cloudDevices []Device, verbose bool) []ScanResult {
 	var results []ScanResult
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -367,7 +367,7 @@ func ScanLAN(ipRange string, key string, cloudDevices []Device) []ScanResult {
 			defer func() { <-semaphore }()
 
 			// First try WITHOUT key to discover device (gets UUID from error response)
-			resp, _, err := QueryDevice(ip, "", false)
+			resp, _, err := QueryDevice(ip, "", "", verbose)
 			if err != nil {
 				return
 			}
@@ -401,11 +401,20 @@ func ScanLAN(ipRange string, key string, cloudDevices []Device) []ScanResult {
 				if result.Type == "" {
 					result.Type = cloudDev.DeviceType
 				}
+			}
 
-				// If in cloud and we have a key, try to get full info
-				if key != "" && result.MAC == "" {
-					resp2, _, err2 := QueryDevice(ip, key, false)
-					if err2 == nil && resp2.Header.Method != "ERROR" {
+			// If we still don't have a MAC and we have a key, try a signed
+			// query to fetch full info (works for any device bound to this
+			// account, whether or not it matched the cloud list). The signed
+			// query must carry the discovered uuid in its header.
+			if key != "" && result.MAC == "" {
+				resp2, _, err2 := QueryDevice(ip, uuid, key, verbose)
+				if err2 == nil {
+					if resp2.Header.Method == "ERROR" {
+						// Device refused our key (sign error) — it's bound to
+						// a different account, so we can't read its MAC locally.
+						result.KeyRejected = true
+					} else {
 						result.MAC = resp2.Payload.All.System.Hardware.MacAddress
 						result.Type = resp2.Payload.All.System.Hardware.Type
 						result.Firmware = resp2.Payload.All.System.Firmware.Version
@@ -432,6 +441,7 @@ func main() {
 	jsonOutput := flag.Bool("json", false, "Output in JSON format")
 	findDevices := flag.Bool("find", false, "Scan LAN for devices after cloud login")
 	findRange := flag.String("find-range", "192.168.178", "IP range to scan (e.g., 192.168.1)")
+	verbose := flag.Bool("verbose", false, "Print raw device requests/responses during LAN scan")
 
 	flag.Parse()
 
@@ -497,7 +507,7 @@ func main() {
 	// LAN scanning if -find flag is set
 	if *findDevices {
 		fmt.Fprintf(os.Stderr, "\nScanning LAN %s.1-254 for devices...\n", *findRange)
-		results := ScanLAN(*findRange, client.key, devices)
+		results := ScanLAN(*findRange, client.key, devices, *verbose)
 
 		// Sort results by IP
 		sort.Slice(results, func(i, j int) bool {
@@ -511,11 +521,17 @@ func main() {
 
 		fmt.Printf("\nFound %d device(s) on LAN:\n\n", len(results))
 		for i, r := range results {
+			mac := r.MAC
+			if mac == "" {
+				mac = "unknown"
+				if r.KeyRejected {
+					mac = "unknown (bound to a different account)"
+				}
+			}
+
 			fmt.Printf("%d. %s\n", i+1, r.IP)
 			fmt.Printf("   UUID:     %s\n", r.UUID)
-			if r.MAC != "" {
-				fmt.Printf("   MAC:      %s\n", r.MAC)
-			}
+			fmt.Printf("   MAC:      %s\n", mac)
 			if r.Type != "" {
 				fmt.Printf("   Type:     %s\n", r.Type)
 			}
